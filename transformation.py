@@ -1,15 +1,21 @@
 import streamlit as st
 import pandas as pd
 from groq import Groq
-import sqlite3
 import json
-import hashlib
 from datetime import datetime
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+from supabase import create_client
 
-# ── Simple Vector Search (replaces ChromaDB) ──
+# ── Supabase setup ──
+@st.cache_resource
+def init_supabase():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+# ── Simple Vector Search ──
 class SimpleVectorStore:
     def __init__(self):
         self.documents = []
@@ -31,80 +37,71 @@ class SimpleVectorStore:
     def count(self):
         return len(self.documents)
 
-# ── Database setup ──
-def init_db():
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE,
-                  password TEXT,
-                  role TEXT,
-                  created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS activity_log
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT,
-                  action TEXT,
-                  timestamp TEXT)''')
-    c.execute("SELECT * FROM users WHERE username='admin'")
-    if not c.fetchone():
-        c.execute("INSERT INTO users VALUES (NULL,'admin','admin123','admin',?)",
-                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
-    conn.commit()
-    conn.close()
-
-def log_activity(username, action):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO activity_log VALUES (NULL,?,?,?)",
-              (username, action, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
-
-def get_all_users():
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("SELECT id, username, role, created_at FROM users")
-    users = c.fetchall()
-    conn.close()
-    return users
-
-def get_activity_log():
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("SELECT username, action, timestamp FROM activity_log ORDER BY timestamp DESC LIMIT 50")
-    logs = c.fetchall()
-    conn.close()
-    return logs
-
-def create_user(username, password, role):
+# ── Database functions ──
+def log_activity(supabase, username, action):
     try:
-        conn = sqlite3.connect("users.db")
-        c = conn.cursor()
-        c.execute("INSERT INTO users VALUES (NULL,?,?,?,?)",
-                  (username, password, role,
-                   datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        conn.commit()
-        conn.close()
+        supabase.table("activity_log").insert({
+            "username": username,
+            "action": action,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }).execute()
+    except:
+        pass
+
+def get_all_users(supabase):
+    try:
+        result = supabase.table("users").select("id, username, role, created_at").execute()
+        return result.data
+    except:
+        return []
+
+def get_activity_log(supabase):
+    try:
+        result = supabase.table("activity_log").select("username, action, timestamp").order("timestamp", desc=True).limit(50).execute()
+        return result.data
+    except:
+        return []
+
+def create_user(supabase, username, password, role):
+    try:
+        supabase.table("users").insert({
+            "username": username,
+            "password": password,
+            "role": role,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }).execute()
         return True
     except:
         return False
 
-def delete_user(username):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE username=?", (username,))
-    conn.commit()
-    conn.close()
+def delete_user(supabase, username):
+    try:
+        supabase.table("users").delete().eq("username", username).execute()
+        return True
+    except:
+        return False
 
-def verify_login(username, password):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("SELECT role FROM users WHERE username=? AND password=?",
-              (username, password))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else None
+def verify_login(supabase, username, password):
+    try:
+        result = supabase.table("users").select("role").eq("username", username).eq("password", password).execute()
+        if result.data:
+            return result.data[0]["role"]
+        return None
+    except:
+        return None
+
+def ensure_admin(supabase):
+    try:
+        result = supabase.table("users").select("id").eq("username", "admin").execute()
+        if not result.data:
+            supabase.table("users").insert({
+                "username": "admin",
+                "password": "admin123",
+                "role": "admin",
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }).execute()
+    except:
+        pass
 
 # ── File reader ──
 def read_file(uploaded_file):
@@ -123,27 +120,30 @@ def read_file(uploaded_file):
         elif file_name.endswith(".txt"):
             content = uploaded_file.read().decode("utf-8")
             lines = content.strip().split("\n")
-            return pd.DataFrame({"message": lines,
-                                  "severity": "INFO",
-                                  "source": "txt",
-                                  "application": "unknown",
-                                  "error_code": "N/A",
-                                  "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                  "root_cause": "N/A",
-                                  "recommendation": "N/A"})
+            return pd.DataFrame({
+                "message": lines,
+                "severity": "INFO",
+                "source": "txt",
+                "application": "unknown",
+                "error_code": "N/A",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "root_cause": "N/A",
+                "recommendation": "N/A"
+            })
     except Exception as e:
         st.error(f"❌ Error reading file: {str(e)}")
         return None
 
 # ── Initialize ──
-init_db()
+st.set_page_config(page_title="GenAI Log Intelligence",
+                   page_icon="🔍", layout="wide")
+
+supabase = init_supabase()
+ensure_admin(supabase)
 
 @st.cache_resource
 def get_vector_store():
     return SimpleVectorStore()
-
-st.set_page_config(page_title="GenAI Log Intelligence",
-                   page_icon="🔍", layout="wide")
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -166,12 +166,12 @@ def login_page():
         password = st.text_input("Password", type="password")
         if st.button("Login", type="primary", use_container_width=True):
             if username and password:
-                role = verify_login(username, password)
+                role = verify_login(supabase, username, password)
                 if role:
                     st.session_state.logged_in = True
                     st.session_state.username = username
                     st.session_state.role = role
-                    log_activity(username, "Logged in")
+                    log_activity(supabase, username, "Logged in")
                     st.rerun()
                 else:
                     st.error("❌ Invalid username or password")
@@ -187,30 +187,34 @@ def admin_page():
     st.title("⚙️ Admin Panel")
     st.caption(f"Logged in as: {st.session_state.username} | Role: Admin")
     if st.button("🚪 Logout"):
-        log_activity(st.session_state.username, "Logged out")
+        log_activity(supabase, st.session_state.username, "Logged out")
         st.session_state.logged_in = False
         st.session_state.username = ""
         st.session_state.role = ""
         st.rerun()
     st.markdown("---")
     tab1, tab2, tab3 = st.tabs(["👥 Users", "➕ Create User", "📋 Activity Log"])
+
     with tab1:
         st.markdown("### All Users")
-        users = get_all_users()
+        users = get_all_users(supabase)
         if users:
-            df_users = pd.DataFrame(users, columns=["ID", "Username", "Role", "Created At"])
+            df_users = pd.DataFrame(users)
             st.dataframe(df_users, use_container_width=True)
             st.markdown("### Delete User")
-            usernames = [u[1] for u in users if u[1] != "admin"]
+            usernames = [u["username"] for u in users if u["username"] != "admin"]
             if usernames:
                 user_to_delete = st.selectbox("Select user to delete", usernames)
                 if st.button("🗑️ Delete User", type="primary"):
-                    delete_user(user_to_delete)
-                    log_activity(st.session_state.username, f"Deleted user: {user_to_delete}")
+                    delete_user(supabase, user_to_delete)
+                    log_activity(supabase, st.session_state.username, f"Deleted user: {user_to_delete}")
                     st.success(f"✅ User {user_to_delete} deleted!")
                     st.rerun()
             else:
                 st.info("No users to delete")
+        else:
+            st.info("No users found")
+
     with tab2:
         st.markdown("### Create New User")
         new_username = st.text_input("New Username")
@@ -218,19 +222,20 @@ def admin_page():
         new_role = st.selectbox("Role", ["user", "admin"])
         if st.button("➕ Create User", type="primary"):
             if new_username and new_password:
-                success = create_user(new_username, new_password, new_role)
+                success = create_user(supabase, new_username, new_password, new_role)
                 if success:
-                    log_activity(st.session_state.username, f"Created user: {new_username}")
+                    log_activity(supabase, st.session_state.username, f"Created user: {new_username}")
                     st.success(f"✅ User {new_username} created!")
                 else:
                     st.error("❌ Username already exists!")
             else:
                 st.warning("⚠️ Please fill all fields")
+
     with tab3:
         st.markdown("### Recent Activity")
-        activity = get_activity_log()
+        activity = get_activity_log(supabase)
         if activity:
-            df_activity = pd.DataFrame(activity, columns=["Username", "Action", "Timestamp"])
+            df_activity = pd.DataFrame(activity)
             st.dataframe(df_activity, use_container_width=True)
         else:
             st.info("No activity yet")
@@ -264,7 +269,7 @@ def analysis_page():
             st.info("Upload a file to load RAG memory")
         st.markdown("---")
         if st.button("🚪 Logout"):
-            log_activity(st.session_state.username, "Logged out")
+            log_activity(supabase, st.session_state.username, "Logged out")
             st.session_state.logged_in = False
             st.session_state.username = ""
             st.session_state.role = ""
@@ -278,7 +283,8 @@ def analysis_page():
     if uploaded_file:
         df = read_file(uploaded_file)
         if df is not None:
-            log_activity(st.session_state.username, f"Uploaded: {uploaded_file.name}")
+            log_activity(supabase, st.session_state.username,
+                         f"Uploaded: {uploaded_file.name}")
             st.success(f"✅ Loaded {len(df):,} records from {uploaded_file.name}")
 
             if vector_store.count() == 0:
@@ -354,7 +360,8 @@ Be specific and beginner friendly."""
                                 messages=[{"role": "user", "content": prompt}]
                             )
                             analysis = response.choices[0].message.content
-                            log_activity(st.session_state.username, "Ran AI analysis")
+                            log_activity(supabase, st.session_state.username,
+                                         "Ran AI analysis")
                             st.markdown("#### 📝 AI Analysis Result")
                             st.markdown(analysis)
                             st.download_button("⬇️ Download Analysis",
@@ -385,7 +392,8 @@ Past incidents:
 
 Question: {question}"""}]
                             )
-                            log_activity(st.session_state.username, f"Asked: {question}")
+                            log_activity(supabase, st.session_state.username,
+                                         f"Asked: {question}")
                             st.markdown(response.choices[0].message.content)
                         except Exception as e:
                             st.error(f"❌ Error: {str(e)}")
